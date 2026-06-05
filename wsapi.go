@@ -58,16 +58,22 @@ func (s *Session) Open() error {
 	s.log(LogInformational, "called")
 
 	var err error
+	var wsConn *websocket.Conn
 
-	// Prevent Open or other major Session functions from
-	// being called while Open is still running.
+	// Prevent concurrent Open attempts, but do not hold the session lock while
+	// waiting on gateway I/O so Close can still interrupt a stuck connection.
 	s.Lock()
-	defer s.Unlock()
-
-	// If the websock is already open, bail out here.
-	if s.wsConn != nil {
+	if s.wsConn != nil || s.opening {
+		s.Unlock()
 		return ErrWSAlreadyOpen
 	}
+	s.opening = true
+	s.Unlock()
+	defer func() {
+		s.Lock()
+		s.opening = false
+		s.Unlock()
+	}()
 
 	sequence := atomic.LoadInt64(s.sequence)
 
@@ -94,15 +100,25 @@ func (s *Session) Open() error {
 	s.log(LogInformational, "connecting to gateway %s", gateway)
 	header := http.Header{}
 	header.Add("accept-encoding", "zlib")
-	s.wsConn, _, err = s.Dialer.Dial(gateway, header)
+	wsConn, _, err = s.Dialer.Dial(gateway, header)
 	if err != nil {
 		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
+		s.Lock()
 		s.gateway = "" // clear cached gateway
-		s.wsConn = nil // Just to be safe.
+		s.Unlock()
 		return err
 	}
 
-	s.wsConn.SetCloseHandler(func(code int, text string) error {
+	s.Lock()
+	if s.wsConn != nil {
+		s.Unlock()
+		wsConn.Close()
+		return ErrWSAlreadyOpen
+	}
+	s.wsConn = wsConn
+	s.Unlock()
+
+	wsConn.SetCloseHandler(func(code int, text string) error {
 		return nil
 	})
 
@@ -111,19 +127,23 @@ func (s *Session) Open() error {
 		// when exiting with an error :)  Maybe someone has a better
 		// way :)
 		if err != nil {
-			s.wsConn.Close()
-			s.wsConn = nil
+			s.Lock()
+			if s.wsConn == wsConn {
+				s.wsConn = nil
+			}
+			s.Unlock()
+			wsConn.Close()
 		}
 	}()
 
 	// The first response from Discord should be an Op 10 (Hello) Packet.
 	// When processed by onEvent the heartbeat goroutine will be started.
-	s.setGatewayReadDeadline(s.wsConn, gatewayHelloTimeout)
-	mt, m, err := s.wsConn.ReadMessage()
+	s.setGatewayReadDeadline(wsConn, gatewayHelloTimeout)
+	mt, m, err := wsConn.ReadMessage()
 	if err != nil {
 		return err
 	}
-	s.setGatewayReadDeadline(s.wsConn, gatewayReadyTimeout)
+	s.setGatewayReadDeadline(wsConn, gatewayReadyTimeout)
 	e, err := s.onEvent(mt, m)
 	if err != nil {
 		return err
@@ -145,7 +165,7 @@ func (s *Session) Open() error {
 	if s.sessionID == "" && sequence == 0 {
 
 		// Send Op 2 Identity Packet
-		err = s.identify()
+		err = s.identify(wsConn)
 		if err != nil {
 			err = fmt.Errorf("error sending identify packet to gateway, %s, %s", s.gateway, err)
 			return err
@@ -161,7 +181,7 @@ func (s *Session) Open() error {
 		p.Data.Sequence = sequence
 
 		s.log(LogInformational, "sending resume packet to gateway")
-		err = s.gatewayWriteJSON(s.wsConn, p)
+		err = s.gatewayWriteJSON(wsConn, p)
 		if err != nil {
 			err = fmt.Errorf("error sending gateway resume packet, %s, %s", s.gateway, err)
 			return err
@@ -184,12 +204,12 @@ func (s *Session) Open() error {
 	}
 
 	// Now Discord should send us a READY or RESUMED packet.
-	s.setGatewayReadDeadline(s.wsConn, gatewayReadyTimeout)
-	mt, m, err = s.wsConn.ReadMessage()
+	s.setGatewayReadDeadline(wsConn, gatewayReadyTimeout)
+	mt, m, err = wsConn.ReadMessage()
 	if err != nil {
 		return err
 	}
-	s.setGatewayReadDeadline(s.wsConn, gatewayReadTimeout)
+	s.setGatewayReadDeadline(wsConn, gatewayReadTimeout)
 	e, err = s.onEvent(mt, m)
 	if err != nil {
 		return err
@@ -213,11 +233,19 @@ func (s *Session) Open() error {
 	// Create listening chan outside of listen, as it needs to happen inside the
 	// mutex lock and needs to exist before calling heartbeat and listen
 	// go rountines.
-	s.listening = make(chan interface{})
+	listening := make(chan interface{})
+	s.Lock()
+	if s.wsConn != wsConn {
+		s.Unlock()
+		err = ErrWSNotFound
+		return err
+	}
+	s.listening = listening
+	s.Unlock()
 
 	// Start sending heartbeats and reading messages from Discord.
-	go s.heartbeat(s.wsConn, s.listening, h.HeartbeatInterval)
-	go s.listen(s.wsConn, s.listening)
+	go s.heartbeat(wsConn, listening, h.HeartbeatInterval)
+	go s.listen(wsConn, listening)
 
 	s.log(LogInformational, "exiting")
 	return nil
@@ -861,7 +889,7 @@ type identifyOp struct {
 }
 
 // identify sends the identify packet to the gateway
-func (s *Session) identify() error {
+func (s *Session) identify(wsConn *websocket.Conn) error {
 	s.log(LogDebug, "called")
 
 	// TODO: This is a temporary block of code to help
@@ -891,7 +919,7 @@ func (s *Session) identify() error {
 	// Send Identify packet to Discord
 	op := identifyOp{2, s.Identify}
 	s.log(LogDebug, "Identify Packet: \n%#v", op)
-	err := s.gatewayWriteJSON(s.wsConn, op)
+	err := s.gatewayWriteJSON(wsConn, op)
 
 	return err
 }

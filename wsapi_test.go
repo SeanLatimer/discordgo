@@ -133,6 +133,65 @@ func TestCloseGatewayConnectionAbortSkipsCloseFrame(t *testing.T) {
 	}
 }
 
+func TestCloseInterruptsBlockedOpen(t *testing.T) {
+	server := httptest.NewServer(httpTestHandler(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Upgrade(w, r, nil, 1024, 1024)
+		if err != nil {
+			t.Fatalf("upgrade failed: %v", err)
+		}
+		defer conn.Close()
+		time.Sleep(2 * time.Second)
+	}))
+	defer server.Close()
+
+	oldHelloTimeout := gatewayHelloTimeout
+	gatewayHelloTimeout = 5 * time.Second
+	defer func() { gatewayHelloTimeout = oldHelloTimeout }()
+
+	s, err := New("Bot test")
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	s.gateway = websocketURL(server.URL)
+	s.ShouldReconnectOnError = false
+
+	openErrCh := make(chan error, 1)
+	go func() {
+		openErrCh <- s.Open()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		s.RLock()
+		wsConn := s.wsConn
+		s.RUnlock()
+		if wsConn != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Open() did not assign wsConn in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	closeStart := time.Now()
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if time.Since(closeStart) > 1500*time.Millisecond {
+		t.Fatal("Close() waited too long while Open() was blocked")
+	}
+
+	select {
+	case err := <-openErrCh:
+		if err == nil {
+			t.Fatal("Open() error = nil, want interruption error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open() did not return after Close()")
+	}
+}
+
 type httpTestHandler func(http.ResponseWriter, *http.Request)
 
 func (h httpTestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

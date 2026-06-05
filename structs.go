@@ -118,7 +118,8 @@ type Session struct {
 	onceHandlers map[string][]*eventHandlerInstance
 
 	// The websocket connection.
-	wsConn *websocket.Conn
+	wsConn  *websocket.Conn
+	opening bool
 
 	// When nil, the session is not listening.
 	listening chan interface{}
